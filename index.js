@@ -1,3 +1,4 @@
+
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
@@ -10,7 +11,6 @@ const PORT = process.env.PORT || 8080;
 const STARTING_BUDGET = 10000;
 const TURN_DURATION_SECONDS = 8;
 const ROUND_OVER_DURATION_MS = 4000;
-const TOTAL_PLAYERS_TO_AUCTION = 60;
 const MAX_PLAYERS_PER_ROOM = 4;
 
 // --- Supabase Setup ---
@@ -169,57 +169,106 @@ const createInitialGameState = (roomCode, hostSessionId, hostPlayerName) => {
 };
 
 /**
- * Draws players, creates sub-pools, and transitions to AUCTION_POOL_VIEW.
+ * Draws players based on specific role quotas and creates tiered sub-pools.
  */
 const drawPlayersLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
 
-    const shuffledCricketers = [...cricketersMasterList];
-    shuffleArray(shuffledCricketers);
-    
-    room.gameState.auctionPool = shuffledCricketers.slice(0, TOTAL_PLAYERS_TO_AUCTION);
-    
-    const subPools = {
-        "Marquee Players": [], "Batsmen 1": [], "Bowlers 1": [],
-        "All-Rounders 1": [], "Wicket-Keepers": [], "Batsmen 2": [],
-        "Bowlers 2": [], "All-Rounders 2": [],
+    // 1. Separate master list by role
+    const allBatsmen = cricketersMasterList.filter(p => p.role === 'Batsman');
+    const allBowlers = cricketersMasterList.filter(p => p.role === 'Bowler');
+    const allAllRounders = cricketersMasterList.filter(p => p.role === 'All-Rounder');
+    const allWicketKeepers = cricketersMasterList.filter(p => p.role === 'Wicket-Keeper');
+
+    // 2. Define quotas for the 60-player pool
+    const quotas = {
+        Batsman: 17,
+        Bowler: 15,
+        'All-Rounder': 20,
+        'Wicket-Keeper': 8
     };
 
-    room.gameState.auctionPool.forEach(player => {
-        if (player.overall >= 90 && subPools["Marquee Players"].length < 8) {
-            subPools["Marquee Players"].push(player);
-        } else {
-            switch(player.role) {
-                case 'Batsman':
-                    if (subPools["Batsmen 1"].length < 8) subPools["Batsmen 1"].push(player);
-                    else subPools["Batsmen 2"].push(player);
-                    break;
-                case 'Bowler':
-                    if (subPools["Bowlers 1"].length < 8) subPools["Bowlers 1"].push(player);
-                    else subPools["Bowlers 2"].push(player);
-                    break;
-                case 'All-Rounder':
-                    if (subPools["All-Rounders 1"].length < 6) subPools["All-Rounders 1"].push(player);
-                    else subPools["All-Rounders 2"].push(player);
-                    break;
-                case 'Wicket-Keeper':
-                    subPools["Wicket-Keepers"].push(player);
-                    break;
-            }
-        }
-    });
+    // 3. Check if there are enough players in the database for each role
+    const errors = [];
+    if (allBatsmen.length < quotas.Batsman) errors.push(`need ${quotas.Batsman} batsmen, found ${allBatsmen.length}`);
+    if (allBowlers.length < quotas.Bowler) errors.push(`need ${quotas.Bowler} bowlers, found ${allBowlers.length}`);
+    if (allAllRounders.length < quotas['All-Rounder']) errors.push(`need ${quotas['All-Rounder']} all-rounders, found ${allAllRounders.length}`);
+    if (allWicketKeepers.length < quotas['Wicket-Keeper']) errors.push(`need ${quotas['Wicket-Keeper']} wicket-keepers, found ${allWicketKeepers.length}`);
 
+    if (errors.length > 0) {
+        const errorMessage = `Cannot draw players, insufficient numbers in database: ${errors.join(', ')}.`;
+        console.error(errorMessage);
+        broadcast(roomCode, { 
+            type: 'ERROR', 
+            payload: { message: errorMessage, fatal: false } 
+        });
+        room.gameState.lastActionMessage = `Error: ${errorMessage}`;
+        return; // Stop the process
+    }
+
+    // 4. Shuffle each role-specific array to randomize selection
+    shuffleArray(allBatsmen);
+    shuffleArray(allBowlers);
+    shuffleArray(allAllRounders);
+    shuffleArray(allWicketKeepers);
+
+    // 5. Select the required number of players for each role
+    const selectedBatsmen = allBatsmen.slice(0, quotas.Batsman);
+    const selectedBowlers = allBowlers.slice(0, quotas.Bowler);
+    const selectedAllRounders = allAllRounders.slice(0, quotas['All-Rounder']);
+    const selectedWicketKeepers = allWicketKeepers.slice(0, quotas['Wicket-Keeper']);
+
+    // 6. Sort selected players by overall rating to create tiered sub-pools
+    const sortByOverall = (a, b) => b.overall - a.overall;
+    selectedBatsmen.sort(sortByOverall);
+    selectedBowlers.sort(sortByOverall);
+    selectedAllRounders.sort(sortByOverall);
+    selectedWicketKeepers.sort(sortByOverall);
+
+    // 7. Create sub-pools with specific sizes
+    const subPools = {
+        "Batsmen 1": selectedBatsmen.slice(0, 8),
+        "Batsmen 2": selectedBatsmen.slice(8, 17),
+        "Bowlers 1": selectedBowlers.slice(0, 7),
+        "Bowlers 2": selectedBowlers.slice(7, 15),
+        "All-Rounders 1": selectedAllRounders.slice(0, 6),
+        "All-Rounders 2": selectedAllRounders.slice(6, 13),
+        "All-Rounders 3": selectedAllRounders.slice(13, 20),
+        "Wicket-Keepers": selectedWicketKeepers,
+    };
+
+    // 8. Define the fixed order for the auction
+    const subPoolOrder = [
+        "Batsmen 1",
+        "Bowlers 1",
+        "All-Rounders 1",
+        "Wicket-Keepers",
+        "Batsmen 2",
+        "All-Rounders 2",
+        "Bowlers 2",
+        "All-Rounders 3",
+    ];
+
+    // 9. Update the main game state
+    room.gameState.auctionPool = [
+        ...selectedBatsmen,
+        ...selectedBowlers,
+        ...selectedAllRounders,
+        ...selectedWicketKeepers
+    ];
     room.gameState.subPools = subPools;
-    room.gameState.subPoolOrder = Object.keys(subPools).filter(k => subPools[k].length > 0);
+    room.gameState.subPoolOrder = subPoolOrder;
     room.gameState.gameStatus = 'AUCTION_POOL_VIEW';
     room.gameState.lastActionMessage = "Auction pool has been drawn!";
     
+    // Reset readiness for the auction pool view
     room.gameState.players.forEach(p => {
         p.isReady = p.isHost;
         p.readyForAuction = p.isHost;
     });
 };
+
 
 /**
  * Starts the auction with the first player from the first sub-pool.
