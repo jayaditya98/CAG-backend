@@ -1,5 +1,4 @@
 
-
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
@@ -10,7 +9,7 @@ import 'dotenv/config';
 // --- Constants ---
 const PORT = process.env.PORT || 8080;
 const STARTING_BUDGET = 10000;
-const TURN_DURATION_SECONDS = 5;
+const TURN_DURATION_SECONDS = 7;
 const ROUND_OVER_DURATION_MS = 4000;
 const MAX_PLAYERS_PER_ROOM = 4;
 
