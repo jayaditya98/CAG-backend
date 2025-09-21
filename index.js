@@ -113,7 +113,7 @@ const createInitialGameState = (roomCode, hostSessionId, hostPlayerName) => ({
     playersInRound: [], lastActionMessage: `Room created by ${hostPlayerName}.`,
     isLoading: false, currentSubPoolName: '', currentSubPoolPlayers: [], nextSubPoolName: '',
     nextSubPoolPlayers: [], currentSubPoolOrderIndex: 0, currentPlayerInSubPoolIndex: -1,
-    unsoldPool: [], isSecondRound: false,
+    unsoldPool: [], isSecondRound: false, nextPlayerForAuction: null,
 });
 
 const drawPlayersLogic = (roomCode) => {
@@ -199,9 +199,40 @@ const startAuctionLogic = (roomCode) => {
     setTimeout(() => nextPlayerLogic(roomCode), PRE_ROUND_DURATION_SECONDS * 1000);
 };
 
+const peekNextPlayerForAuction = (room) => {
+    // This is a non-mutating version of nextPlayerLogic to find the next player
+    const { currentPlayerInSubPoolIndex, currentSubPoolOrderIndex, subPoolOrder, subPools, isSecondRound, unsoldPool } = room.gameState;
+    
+    const nextPlayerIndex = currentPlayerInSubPoolIndex + 1;
+    const currentSubPoolName = subPoolOrder[currentSubPoolOrderIndex];
+    const currentPool = subPools[currentSubPoolName];
+
+    if (!currentPool || nextPlayerIndex >= currentPool.length) {
+        const nextSubPoolIndex = currentSubPoolOrderIndex + 1;
+        if (nextSubPoolIndex >= subPoolOrder.length) {
+            // Check if we can start an unsold round
+            if (!isSecondRound && unsoldPool.length > 0) {
+                 const nextUnsoldPoolName = Object.keys(subPools).find(key => key.startsWith('Unsold') && subPools[key].length > 0);
+                 if (nextUnsoldPoolName) {
+                     room.gameState.nextPlayerForAuction = subPools[nextUnsoldPoolName][0];
+                     return;
+                 }
+            }
+            room.gameState.nextPlayerForAuction = null; // Game is over
+            return;
+        }
+        const nextPoolName = subPoolOrder[nextSubPoolIndex];
+        const nextPool = subPools[nextPoolName];
+        room.gameState.nextPlayerForAuction = nextPool?.[0] || null;
+    } else {
+        room.gameState.nextPlayerForAuction = currentPool[nextPlayerIndex];
+    }
+};
+
 const nextPlayerLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
+    room.gameState.nextPlayerForAuction = null; // Clear peeked player
 
     const nextPlayerIndex = room.gameState.currentPlayerInSubPoolIndex + 1;
     const currentSubPoolIndex = room.gameState.currentSubPoolOrderIndex;
@@ -209,7 +240,6 @@ const nextPlayerLogic = (roomCode) => {
     const currentPool = room.gameState.subPools[currentSubPoolName];
 
     if (!currentPool || nextPlayerIndex >= currentPool.length) {
-        // ... (Same unsold/game over logic as before) ...
         const nextSubPoolIndex = currentSubPoolIndex + 1;
 
         if (nextSubPoolIndex >= room.gameState.subPoolOrder.length) {
@@ -251,9 +281,9 @@ const nextPlayerLogic = (roomCode) => {
 
             const nextPoolName = finalSubPoolOrder[0];
             room.gameState.gameStatus = 'SUBPOOL_BREAK';
-            room.gameState.currentSubPoolName = "--- UNSOLD ROUND ---";
+            room.gameState.currentSubPoolName = currentSubPoolName;
             room.gameState.nextSubPoolName = nextPoolName;
-            room.gameState.currentSubPoolPlayers = [];
+            room.gameState.currentSubPoolPlayers = currentPool;
             room.gameState.nextSubPoolPlayers = finalSubPools[nextPoolName];
             
             room.gameState.players.forEach(p => { if (!p.isHost) p.isReady = false; });
@@ -268,7 +298,7 @@ const nextPlayerLogic = (roomCode) => {
         room.gameState.nextSubPoolName = nextPoolName;
         room.gameState.currentSubPoolPlayers = currentPool || [];
         room.gameState.nextSubPoolPlayers = room.gameState.subPools[nextPoolName];
-        room.gameState.currentPlayerForAuction = null; // Clear card for break
+        room.gameState.currentPlayerForAuction = null;
         
         room.gameState.players.forEach(p => { if (!p.isHost) p.isReady = false; });
         
@@ -303,16 +333,15 @@ const continueToNextSubPoolLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
     
-    // Transition to the pre-round timer state first
+    peekNextPlayerForAuction(room);
     room.gameState.gameStatus = 'PRE_ROUND_TIMER';
     broadcastGameState(roomCode);
     
-    // After the timer, actually advance the logic
     setTimeout(() => {
-        if (room.gameState.isSecondRound && room.gameState.currentSubPoolOrderIndex === 0) {
-            // First pool of second round
+        if (room.gameState.isSecondRound && room.gameState.currentSubPoolOrderIndex === 0 && !room.gameState.subPoolOrder[0].startsWith('Unsold')) {
+             // Logic to handle transition to first unsold pool
         } else {
-            room.gameState.currentSubPoolOrderIndex++;
+             room.gameState.currentSubPoolOrderIndex++;
         }
         
         room.gameState.currentPlayerInSubPoolIndex = -1;
@@ -325,7 +354,6 @@ const continueToNextSubPoolLogic = (roomCode) => {
 };
 
 const endRoundLogic = (roomCode) => {
-    // ... same logic as before
     const room = rooms[roomCode];
     if (!room || room.gameState.gameStatus === 'ROUND_OVER') return;
     
@@ -359,75 +387,70 @@ const endRoundLogic = (roomCode) => {
     });
     
     room.gameState.gameStatus = 'ROUND_OVER';
+    peekNextPlayerForAuction(room);
     broadcastGameState(roomCode);
 
     setTimeout(() => nextPlayerLogic(roomCode), ROUND_OVER_DURATION_MS);
 };
 
-const advanceTurn = (roomCode, actionPlayerId, actionType) => {
-    // ... same logic as before
+const advanceTurn = (roomCode, actingPlayerId, actionType) => {
     const room = rooms[roomCode];
-    if (!room || room.gameState.gameStatus !== 'AUCTION') return;
-    
+    if (!room || room.gameState.gameStatus !== 'AUCTION' || room.gameState.activePlayerId !== actingPlayerId) return;
+
     if (room.turnTimer) clearTimeout(room.turnTimer);
 
-    const { biddingOrder, highestBidderId } = room.gameState;
-    let { playersInRound } = room.gameState;
-    
-    if (actionType === 'DROP' || actionType === 'TIMEOUT') {
-        playersInRound = playersInRound.filter(id => id !== actionPlayerId);
+    let { playersInRound, highestBidderId, biddingOrder } = room.gameState;
+
+    // 1. Handle Action
+    if (['DROP', 'TIMEOUT'].includes(actionType)) {
+        playersInRound = playersInRound.filter(id => id !== actingPlayerId);
         room.gameState.playersInRound = playersInRound;
-        
-        const player = room.gameState.players.find(p => p.id === actionPlayerId);
+        const player = room.gameState.players.find(p => p.id === actingPlayerId);
         if (player) {
             room.gameState.lastActionMessage = `${player.name} ${actionType === 'TIMEOUT' ? 'timed out' : 'dropped'}.`;
         }
     }
 
+    // 2. Check for End Conditions
     if (playersInRound.length === 0) {
-        endRoundLogic(roomCode);
+        endRoundLogic(roomCode); // Player is unsold
         return;
     }
-
+    
     if (playersInRound.length === 1) {
-        if (!highestBidderId) {
-            room.gameState.activePlayerId = playersInRound[0];
-            room.turnTimer = setTimeout(() => advanceTurn(roomCode, room.gameState.activePlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
+        // If the only person left is not the highest bidder (or no one has bid), they get one last turn.
+        // If they bid, they win. If they pass/timeout, the current highest bidder (if any) wins, or player is unsold.
+        const lastPlayerId = playersInRound[0];
+        if (lastPlayerId !== highestBidderId) {
+            room.gameState.activePlayerId = lastPlayerId;
+            room.turnTimer = setTimeout(() => advanceTurn(roomCode, lastPlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
             broadcastGameState(roomCode);
             return;
+        } else {
+            endRoundLogic(roomCode); // The highest bidder is the last one left, they win
+            return;
         }
-        endRoundLogic(roomCode);
-        return;
     }
 
-    const currentActiveIndex = biddingOrder.indexOf(actionPlayerId);
-    if (currentActiveIndex === -1) {
-        endRoundLogic(roomCode);
-        return;
-    }
-
+    // 3. Find Next Player
+    const currentActiveIndex = biddingOrder.indexOf(actingPlayerId);
     let nextIndex = (currentActiveIndex + 1) % biddingOrder.length;
-    let loopDetector = 0;
-    while (!playersInRound.includes(biddingOrder[nextIndex]) && loopDetector < biddingOrder.length) {
+    
+    // Find the next player who is still in the round
+    while (!playersInRound.includes(biddingOrder[nextIndex])) {
         nextIndex = (nextIndex + 1) % biddingOrder.length;
-        loopDetector++;
     }
-
     const nextPlayerId = biddingOrder[nextIndex];
 
+    // If the turn cycles back to the highest bidder, they win because everyone else passed.
     if (highestBidderId && nextPlayerId === highestBidderId) {
         endRoundLogic(roomCode);
         return;
     }
-    
-    if (loopDetector >= biddingOrder.length) {
-        endRoundLogic(roomCode);
-        return;
-    }
 
+    // 4. Set next turn
     room.gameState.activePlayerId = nextPlayerId;
-    room.turnTimer = setTimeout(() => advanceTurn(roomCode, room.gameState.activePlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
-    
+    room.turnTimer = setTimeout(() => advanceTurn(roomCode, nextPlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
     broadcastGameState(roomCode);
 };
 
