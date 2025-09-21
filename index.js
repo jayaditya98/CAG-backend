@@ -101,14 +101,26 @@ const shuffleArray = (array) => {
 
 /**
  * Maps database-specific role names to the application's standard role names.
- * @param {string} dbRole The role name from the database (e.g., 'batter', 'wk').
+ * This is now case-insensitive to handle variations like 'Batter' vs 'batter'.
+ * @param {string} dbRole The role name from the database (e.g., 'Batter', 'wk').
  * @returns {string} The application-standard role name (e.g., 'Batsman', 'Wicket-Keeper').
  */
 const mapDbRoleToGameRole = (dbRole) => {
-  switch (dbRole) {
-    case 'batter': return 'Batsman';
-    case 'wk': return 'Wicket-Keeper';
-    default: return dbRole; // Assumes 'Bowler' and 'All-Rounder' match
+  if (typeof dbRole !== 'string') {
+    return 'Unknown'; 
+  }
+  const lowerCaseRole = dbRole.toLowerCase();
+  switch (lowerCaseRole) {
+    case 'batter':
+      return 'Batsman';
+    case 'wk':
+      return 'Wicket-Keeper';
+    case 'bowler':
+      return 'Bowler';
+    case 'all-rounder':
+      return 'All-Rounder';
+    default:
+      return dbRole; // Fallback for any roles that already match
   }
 };
 
@@ -126,7 +138,7 @@ const fetchCricketers = async () => {
     console.error("Error fetching cricketers:", error);
     return;
   }
-  // Map Supabase columns to our Cricketer type
+  // Map Supabase columns to our Cricketer type, using the corrected mapping function
   cricketersMasterList = data.map(c => ({
     id: c.id,
     name: c.Name,
@@ -431,7 +443,9 @@ const advanceTurn = (roomCode, wasAutoPass = false) => {
         const timedOutPlayerId = room.gameState.activePlayerId;
         room.gameState.playersInRound = playersInRound.filter(id => id !== timedOutPlayerId);
         const timedOutPlayer = room.gameState.players.find(p=>p.id === timedOutPlayerId);
-        room.gameState.lastActionMessage = `${timedOutPlayer.name} timed out and dropped from the round.`;
+        if (timedOutPlayer) {
+            room.gameState.lastActionMessage = `${timedOutPlayer.name} timed out and dropped from the round.`;
+        }
         if (room.gameState.playersInRound.length <= 1) {
             endRoundLogic(roomCode);
             return;
@@ -441,6 +455,11 @@ const advanceTurn = (roomCode, wasAutoPass = false) => {
     let nextIndex = (currentActiveIndex + 1) % biddingOrder.length;
     while (!room.gameState.playersInRound.includes(biddingOrder[nextIndex])) {
         nextIndex = (nextIndex + 1) % biddingOrder.length;
+        if (biddingOrder[nextIndex] === room.gameState.activePlayerId) {
+             // We've looped all the way around, something is wrong, end the round
+            endRoundLogic(roomCode);
+            return;
+        }
     }
     
     room.gameState.activePlayerId = biddingOrder[nextIndex];
