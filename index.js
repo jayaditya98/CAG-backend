@@ -338,12 +338,7 @@ const continueToNextSubPoolLogic = (roomCode) => {
     broadcastGameState(roomCode);
     
     setTimeout(() => {
-        if (room.gameState.isSecondRound && room.gameState.currentSubPoolOrderIndex === 0 && !room.gameState.subPoolOrder[0].startsWith('Unsold')) {
-             // Logic to handle transition to first unsold pool
-        } else {
-             room.gameState.currentSubPoolOrderIndex++;
-        }
-        
+        room.gameState.currentSubPoolOrderIndex++;
         room.gameState.currentPlayerInSubPoolIndex = -1;
         room.gameState.nextSubPoolName = '';
         room.gameState.nextSubPoolPlayers = [];
@@ -359,24 +354,26 @@ const endRoundLogic = (roomCode) => {
     
     if (room.turnTimer) clearTimeout(room.turnTimer);
 
-    const { highestBidderId, currentBid, currentPlayerForAuction } = room.gameState;
+    const { highestBidderId, currentBid, currentPlayerForAuction, playersInRound } = room.gameState;
     let winnerId = 'UNSOLD';
     let winningBid = 0;
+    
+    const potentialWinnerId = highestBidderId || (playersInRound.length === 1 ? playersInRound[0] : null);
 
-    if (highestBidderId && room.gameState.playersInRound.includes(highestBidderId)) {
-        const winner = room.gameState.players.find(p => p.id === highestBidderId);
-        if (winner) {
+    if (potentialWinnerId && playersInRound.includes(potentialWinnerId)) {
+        const winner = room.gameState.players.find(p => p.id === potentialWinnerId);
+        // A bid must have been placed for a player to be sold
+        if (winner && highestBidderId) {
             winner.budget -= currentBid;
             winner.squad.push(currentPlayerForAuction);
             winnerId = winner.id;
             winningBid = currentBid;
             room.gameState.lastActionMessage = `${currentPlayerForAuction.name} sold to ${winner.name} for ${currentBid}!`;
         }
-    } else {
-        room.gameState.lastActionMessage = `${currentPlayerForAuction.name} was unsold.`;
-    }
+    } 
 
     if (winnerId === 'UNSOLD') {
+        room.gameState.lastActionMessage = `${currentPlayerForAuction.name} was unsold.`;
         room.gameState.unsoldPool.push(currentPlayerForAuction);
     }
 
@@ -395,60 +392,60 @@ const endRoundLogic = (roomCode) => {
 
 const advanceTurn = (roomCode, actingPlayerId, actionType) => {
     const room = rooms[roomCode];
-    if (!room || room.gameState.gameStatus !== 'AUCTION' || room.gameState.activePlayerId !== actingPlayerId) return;
+    if (!room || room.gameState.gameStatus !== 'AUCTION' || room.gameState.activePlayerId !== actingPlayerId) {
+        return;
+    }
 
     if (room.turnTimer) clearTimeout(room.turnTimer);
 
-    let { playersInRound, highestBidderId, biddingOrder } = room.gameState;
+    const actingPlayer = room.gameState.players.find(p => p.id === actingPlayerId);
 
-    // 1. Handle Action
+    // 1. Update state based on the action
     if (['DROP', 'TIMEOUT'].includes(actionType)) {
-        playersInRound = playersInRound.filter(id => id !== actingPlayerId);
-        room.gameState.playersInRound = playersInRound;
-        const player = room.gameState.players.find(p => p.id === actingPlayerId);
-        if (player) {
-            room.gameState.lastActionMessage = `${player.name} ${actionType === 'TIMEOUT' ? 'timed out' : 'dropped'}.`;
+        room.gameState.playersInRound = room.gameState.playersInRound.filter(id => id !== actingPlayerId);
+        if (actingPlayer) {
+            room.gameState.lastActionMessage = `${actingPlayer.name} ${actionType === 'TIMEOUT' ? 'timed out' : 'dropped'}.`;
+        }
+    } else if (actionType === 'PASS') {
+        if (actingPlayer) {
+            room.gameState.lastActionMessage = `${actingPlayer.name} passed.`;
         }
     }
 
-    // 2. Check for End Conditions
-    if (playersInRound.length === 0) {
-        endRoundLogic(roomCode); // Player is unsold
-        return;
-    }
-    
-    if (playersInRound.length === 1) {
-        // If the only person left is not the highest bidder (or no one has bid), they get one last turn.
-        // If they bid, they win. If they pass/timeout, the current highest bidder (if any) wins, or player is unsold.
-        const lastPlayerId = playersInRound[0];
-        if (lastPlayerId !== highestBidderId) {
-            room.gameState.activePlayerId = lastPlayerId;
-            room.turnTimer = setTimeout(() => advanceTurn(roomCode, lastPlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
-            broadcastGameState(roomCode);
-            return;
-        } else {
-            endRoundLogic(roomCode); // The highest bidder is the last one left, they win
-            return;
-        }
-    }
+    const { playersInRound, highestBidderId, biddingOrder } = room.gameState;
 
-    // 3. Find Next Player
-    const currentActiveIndex = biddingOrder.indexOf(actingPlayerId);
-    let nextIndex = (currentActiveIndex + 1) % biddingOrder.length;
-    
-    // Find the next player who is still in the round
-    while (!playersInRound.includes(biddingOrder[nextIndex])) {
-        nextIndex = (nextIndex + 1) % biddingOrder.length;
-    }
-    const nextPlayerId = biddingOrder[nextIndex];
-
-    // If the turn cycles back to the highest bidder, they win because everyone else passed.
-    if (highestBidderId && nextPlayerId === highestBidderId) {
+    // 2. Check for round end conditions
+    // Condition A: Only one or zero players are left in the round.
+    if (playersInRound.length <= 1) {
         endRoundLogic(roomCode);
         return;
     }
 
-    // 4. Set next turn
+    // 3. Find the next eligible player in the bidding order
+    const currentActiveIndex = biddingOrder.indexOf(actingPlayerId);
+    let nextPlayerId = null;
+    
+    // Loop through the order to find the next player who is still in the round.
+    for (let i = 1; i <= biddingOrder.length; i++) {
+        const nextIndex = (currentActiveIndex + i) % biddingOrder.length;
+        const potentialNextPlayerId = biddingOrder[nextIndex];
+        if (playersInRound.includes(potentialNextPlayerId)) {
+            nextPlayerId = potentialNextPlayerId;
+            break;
+        }
+    }
+
+    // Condition B: The turn has cycled back to the current highest bidder, meaning they've won.
+    if (highestBidderId && nextPlayerId === highestBidderId) {
+        endRoundLogic(roomCode);
+        return;
+    }
+    
+    // Condition C (Unsold): A full circle of passes with no bid. This is tricky,
+    // but the `playersInRound.length <= 1` check handles the 2-player case correctly.
+    // An infinite loop is prevented because players will eventually time out or drop.
+
+    // 4. If no end condition is met, advance to the next player's turn
     room.gameState.activePlayerId = nextPlayerId;
     room.turnTimer = setTimeout(() => advanceTurn(roomCode, nextPlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
     broadcastGameState(roomCode);
@@ -520,7 +517,7 @@ wss.on('connection', (ws) => {
                     }
                     break;
                 }
-                case 'PASS_TURN': { if (room.gameState.activePlayerId === userSessionId) { room.gameState.lastActionMessage = `${player.name} passed the turn.`; advanceTurn(roomCode, userSessionId, 'PASS'); } break; }
+                case 'PASS_TURN': { if (room.gameState.activePlayerId === userSessionId) { advanceTurn(roomCode, userSessionId, 'PASS'); } break; }
                 case 'DROP_FROM_ROUND': { if (room.gameState.activePlayerId === userSessionId) { advanceTurn(roomCode, userSessionId, 'DROP'); } break; }
                 case 'CONTINUE_TO_NEXT_SUBPOOL': {
                     if (player.isHost) {
