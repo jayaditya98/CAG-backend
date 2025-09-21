@@ -1,499 +1,588 @@
-import { createServer } from 'http';
 import express from 'express';
+import http from 'http';
 import { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 
-// --- CONFIGURATION ---
+// --- Constants ---
 const PORT = process.env.PORT || 8080;
-const supabaseUrl = process.env.SUPABASE_URL || "https://mvxfdgmgfrgcrqvrtsaq.supabase.co";
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJI-zI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im12eGZkZ21nZnJnY3JxdnJ0c2FxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg0NTIwMjUsImV4cCI6MjA3NDAyODAyNX0.y0_Ho2SmLnhmRIjkYW0tgENIORTIOm1bFDZevRwHsn8";
+const STARTING_BUDGET = 10000;
+const TURN_DURATION_SECONDS = 8;
+const ROUND_OVER_DURATION_MS = 4000;
+const TOTAL_PLAYERS_TO_AUCTION = 60;
+const MAX_PLAYERS_PER_ROOM = 4;
 
+// --- Supabase Setup ---
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  console.error("Supabase URL or Anon Key is missing. Make sure to set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.");
+  process.exit(1);
+}
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-const app = express();
-const server = createServer(app);
-const wss = new WebSocketServer({ server });
-
-// --- CONSTANTS & ENUMS (mirrored from client) ---
-const STARTING_BUDGET = 10000;
-const TOTAL_PLAYERS_TO_AUCTION = 60;
-const ROUND_OVER_DURATION_MS = 4000;
-
-const CricketerRole = {
-  Batsman: 'Batsman',
-  Bowler: 'Bowler',
-  AllRounder: 'All-Rounder',
-  WicketKeeper: 'Wicket-Keeper',
-};
-
-// --- IN-MEMORY STATE MANAGEMENT ---
-const rooms = new Map(); // K: roomCode, V: { gameState, clients: Map<sessionId, ws> }
+// --- In-Memory State ---
+// This will hold all active game rooms.
+// rooms = { 'ROOM_CODE': { gameState: {...}, clients: { 'sessionId': ws }, turnTimer: Timeout } }
+const rooms = {};
 let cricketersMasterList = [];
 
-// --- UTILITY FUNCTIONS ---
-const shuffleArray = (array) => [...array].sort(() => Math.random() - 0.5);
-const getBidIncrement = (currentBid) => {
-  if (currentBid < 100) return 5;
-  if (currentBid < 200) return 10;
-  if (currentBid < 500) return 20;
-  return 25;
+// --- Helper Functions ---
+
+/**
+ * Generates a random 6-character uppercase room code.
+ */
+const generateRoomCode = () => {
+  let code;
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  do {
+    code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+  } while (rooms[code]); // Ensure code is unique
+  return code;
 };
 
+/**
+ * Sends a message to all clients in a specific room.
+ * @param {string} roomCode The code of the room.
+ * @param {object} message The message object to send.
+ */
 const broadcast = (roomCode, message) => {
-  const room = rooms.get(roomCode);
-  if (room) {
-    for (const client of room.clients.values()) {
-      if (client.readyState === client.OPEN) {
-        client.send(JSON.stringify(message));
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  const messageString = JSON.stringify(message);
+  for (const sessionId in room.clients) {
+    const client = room.clients[sessionId];
+    if (client.readyState === client.OPEN) {
+      client.send(messageString);
+    }
+  }
+};
+
+/**
+ * A more specific broadcast function for game state updates.
+ * @param {string} roomCode The code of the room.
+ */
+const broadcastGameState = (roomCode) => {
+  const room = rooms[roomCode];
+  if (room && room.gameState) {
+    broadcast(roomCode, {
+      type: 'GAME_STATE_UPDATE',
+      payload: room.gameState
+    });
+  }
+};
+
+/**
+ * Calculates the bid increment based on the current bid amount.
+ */
+const getBidIncrement = (bid) => {
+    if (bid < 100) return 5;
+    if (bid < 200) return 10;
+    if (bid < 500) return 20;
+    return 25;
+};
+
+/**
+ * Shuffles an array in place.
+ * @param {Array} array The array to shuffle.
+ */
+const shuffleArray = (array) => {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+};
+
+
+// --- Core Game Logic Functions ---
+
+/**
+ * Fetches the master list of cricketers from Supabase.
+ */
+const fetchCricketers = async () => {
+  if (cricketersMasterList.length > 0) return;
+  console.log("Fetching cricketers from Supabase...");
+  const { data, error } = await supabase.from('cricketers').select('*');
+  if (error) {
+    console.error("Error fetching cricketers:", error);
+    return;
+  }
+  // Map Supabase columns to our Cricketer type
+  cricketersMasterList = data.map(c => ({
+    id: c.id,
+    name: c.Name,
+    role: c.ROLE,
+    basePrice: c.base_price,
+    image: c.image,
+    overall: c.OVR,
+    battingOVR: c['Batting OVR'],
+    bowlingOVR: c['Bowling OVR'],
+    fieldingOVR: c['Fielding OVR'],
+  }));
+  console.log(`Fetched ${cricketersMasterList.length} cricketers.`);
+};
+
+/**
+ * Creates the initial state for a new game.
+ */
+const createInitialGameState = (roomCode, hostSessionId, hostPlayerName) => {
+  const hostPlayer = {
+    id: hostSessionId,
+    name: hostPlayerName,
+    budget: STARTING_BUDGET,
+    squad: [],
+    isHost: true,
+    isReady: true, // Host is always ready
+    readyForAuction: true,
+  };
+
+  return {
+    gameStatus: 'LOBBY',
+    roomCode: roomCode,
+    players: [hostPlayer],
+    auctionPool: [],
+    subPools: {},
+    subPoolOrder: [],
+    cricketersMasterList: [], // Will be populated by DRAW_PLAYERS
+    currentPlayerForAuction: null,
+    auctionHistory: [],
+    currentBid: 0,
+    highestBidderId: null,
+    activePlayerId: '',
+    masterBiddingOrder: [],
+    biddingOrder: [],
+    startingPlayerIndex: 0,
+    playersInRound: [],
+    lastActionMessage: `Room created by ${hostPlayerName}.`,
+    isLoading: false,
+    currentSubPoolName: '',
+    currentSubPoolPlayers: [],
+    nextSubPoolName: '',
+    nextSubPoolPlayers: [],
+  };
+};
+
+/**
+ * Draws players, creates sub-pools, and transitions to AUCTION_POOL_VIEW.
+ */
+const drawPlayersLogic = (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    const shuffledCricketers = [...cricketersMasterList];
+    shuffleArray(shuffledCricketers);
+    
+    room.gameState.auctionPool = shuffledCricketers.slice(0, TOTAL_PLAYERS_TO_AUCTION);
+    
+    const subPools = {
+        "Marquee Players": [], "Batsmen 1": [], "Bowlers 1": [],
+        "All-Rounders 1": [], "Wicket-Keepers": [], "Batsmen 2": [],
+        "Bowlers 2": [], "All-Rounders 2": [],
+    };
+
+    room.gameState.auctionPool.forEach(player => {
+        if (player.overall >= 90 && subPools["Marquee Players"].length < 8) {
+            subPools["Marquee Players"].push(player);
+        } else {
+            switch(player.role) {
+                case 'Batsman':
+                    if (subPools["Batsmen 1"].length < 8) subPools["Batsmen 1"].push(player);
+                    else subPools["Batsmen 2"].push(player);
+                    break;
+                case 'Bowler':
+                    if (subPools["Bowlers 1"].length < 8) subPools["Bowlers 1"].push(player);
+                    else subPools["Bowlers 2"].push(player);
+                    break;
+                case 'All-Rounder':
+                    if (subPools["All-Rounders 1"].length < 6) subPools["All-Rounders 1"].push(player);
+                    else subPools["All-Rounders 2"].push(player);
+                    break;
+                case 'Wicket-Keeper':
+                    subPools["Wicket-Keepers"].push(player);
+                    break;
+            }
+        }
+    });
+
+    room.gameState.subPools = subPools;
+    room.gameState.subPoolOrder = Object.keys(subPools).filter(k => subPools[k].length > 0);
+    room.gameState.gameStatus = 'AUCTION_POOL_VIEW';
+    room.gameState.lastActionMessage = "Auction pool has been drawn!";
+    
+    room.gameState.players.forEach(p => {
+        p.isReady = p.isHost;
+        p.readyForAuction = p.isHost;
+    });
+};
+
+/**
+ * Starts the auction with the first player from the first sub-pool.
+ */
+const startAuctionLogic = (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    room.gameState.masterBiddingOrder = room.gameState.players.map(p => p.id);
+    shuffleArray(room.gameState.masterBiddingOrder);
+    room.gameState.startingPlayerIndex = 0;
+    
+    nextPlayerLogic(roomCode);
+};
+
+/**
+ * Logic to bring the next player up for auction.
+ */
+const nextPlayerLogic = (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    if (!room.gameState.currentSubPoolName) {
+        room.gameState.currentSubPoolName = room.gameState.subPoolOrder[0];
+    }
+    
+    let currentPool = room.gameState.subPools[room.gameState.currentSubPoolName];
+    
+    if (!currentPool || currentPool.length === 0) {
+        const currentPoolIndex = room.gameState.subPoolOrder.indexOf(room.gameState.currentSubPoolName);
+        const nextPoolIndex = currentPoolIndex + 1;
+
+        if (nextPoolIndex >= room.gameState.subPoolOrder.length) {
+            room.gameState.gameStatus = 'GAME_OVER';
+            room.gameState.lastActionMessage = 'The auction has concluded!';
+            broadcastGameState(roomCode);
+            return;
+        }
+
+        const nextPoolName = room.gameState.subPoolOrder[nextPoolIndex];
+        room.gameState.gameStatus = 'SUBPOOL_BREAK';
+        room.gameState.nextSubPoolName = nextPoolName;
+        room.gameState.nextSubPoolPlayers = room.gameState.subPools[nextPoolName];
+        room.gameState.currentSubPoolPlayers = room.gameState.subPools[room.gameState.currentSubPoolName] || [];
+        broadcastGameState(roomCode);
+        return;
+    }
+
+    const nextPlayer = currentPool.shift();
+    room.gameState.currentPlayerForAuction = nextPlayer;
+    room.gameState.currentBid = nextPlayer.basePrice;
+    room.gameState.highestBidderId = null;
+    room.gameState.playersInRound = room.gameState.players.filter(p => p.budget >= nextPlayer.basePrice).map(p => p.id);
+    room.gameState.gameStatus = 'AUCTION';
+
+    const masterOrder = room.gameState.masterBiddingOrder;
+    const startIndex = room.gameState.startingPlayerIndex;
+    room.gameState.biddingOrder = [
+        ...masterOrder.slice(startIndex),
+        ...masterOrder.slice(0, startIndex)
+    ].filter(id => room.gameState.playersInRound.includes(id));
+    
+    room.gameState.activePlayerId = room.gameState.biddingOrder[0] || null;
+    room.gameState.startingPlayerIndex = (startIndex + 1) % masterOrder.length;
+
+    if (room.turnTimer) clearTimeout(room.turnTimer);
+    room.turnTimer = setTimeout(() => advanceTurn(roomCode, true), TURN_DURATION_SECONDS * 1000);
+
+    broadcastGameState(roomCode);
+};
+
+/**
+ * Moves to the next sub-pool after a break.
+ */
+const continueToNextSubPoolLogic = (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+    
+    const currentPoolIndex = room.gameState.subPoolOrder.indexOf(room.gameState.currentSubPoolName);
+    const nextPoolName = room.gameState.subPoolOrder[currentPoolIndex + 1];
+
+    room.gameState.currentSubPoolName = nextPoolName;
+    room.gameState.nextSubPoolName = '';
+    room.gameState.nextSubPoolPlayers = [];
+    
+    nextPlayerLogic(roomCode);
+};
+
+/**
+ * Ends the bidding round for a player.
+ */
+const endRoundLogic = (roomCode, wasUnsold = false) => {
+    const room = rooms[roomCode];
+    if (!room || room.gameState.gameStatus === 'ROUND_OVER') return;
+    
+    if (room.turnTimer) clearTimeout(room.turnTimer);
+
+    const { highestBidderId, currentBid, currentPlayerForAuction } = room.gameState;
+    let winnerId = 'UNSOLD';
+    let winningBid = 0;
+
+    if (!wasUnsold && highestBidderId) {
+        const winner = room.gameState.players.find(p => p.id === highestBidderId);
+        if (winner) {
+            winner.budget -= currentBid;
+            winner.squad.push(currentPlayerForAuction);
+            winnerId = winner.id;
+            winningBid = currentBid;
+            room.gameState.lastActionMessage = `${currentPlayerForAuction.name} sold to ${winner.name} for ${currentBid}!`;
+        }
+    } else {
+        room.gameState.lastActionMessage = `${currentPlayerForAuction.name} was unsold.`;
+    }
+
+    room.gameState.auctionHistory.push({
+        cricketer: currentPlayerForAuction,
+        winningBid: winningBid,
+        winnerId: winnerId,
+    });
+    
+    room.gameState.gameStatus = 'ROUND_OVER';
+    broadcastGameState(roomCode);
+
+    setTimeout(() => nextPlayerLogic(roomCode), ROUND_OVER_DURATION_MS);
+};
+
+/**
+ * Advances the turn to the next player.
+ * @param {boolean} wasAutoPass - True if the turn advanced due to timeout.
+ */
+const advanceTurn = (roomCode, wasAutoPass = false) => {
+    const room = rooms[roomCode];
+    if (!room || room.gameState.gameStatus !== 'AUCTION') return;
+    
+    if (room.turnTimer) clearTimeout(room.turnTimer);
+
+    const { biddingOrder, playersInRound } = room.gameState;
+    
+    if (playersInRound.length <= 1) {
+        endRoundLogic(roomCode);
+        return;
+    }
+
+    const currentActiveIndex = biddingOrder.indexOf(room.gameState.activePlayerId);
+    
+    if(wasAutoPass) {
+        const timedOutPlayerId = room.gameState.activePlayerId;
+        room.gameState.playersInRound = playersInRound.filter(id => id !== timedOutPlayerId);
+        const timedOutPlayer = room.gameState.players.find(p=>p.id === timedOutPlayerId);
+        room.gameState.lastActionMessage = `${timedOutPlayer.name} timed out and dropped from the round.`;
+        if (room.gameState.playersInRound.length <= 1) {
+            endRoundLogic(roomCode);
+            return;
+        }
+    }
+
+    let nextIndex = (currentActiveIndex + 1) % biddingOrder.length;
+    while (!room.gameState.playersInRound.includes(biddingOrder[nextIndex])) {
+        nextIndex = (nextIndex + 1) % biddingOrder.length;
+    }
+    
+    room.gameState.activePlayerId = biddingOrder[nextIndex];
+
+    room.turnTimer = setTimeout(() => advanceTurn(roomCode, true), TURN_DURATION_SECONDS * 1000);
+    
+    broadcastGameState(roomCode);
+};
+
+
+// --- Server Setup ---
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  let userSessionId = null;
+  let userRoomCode = null;
+
+  ws.on('message', (message) => {
+    try {
+        const { type, payload } = JSON.parse(message);
+
+        switch (type) {
+          case 'CREATE_ROOM': {
+            const roomCode = generateRoomCode();
+            const { sessionId, playerName } = payload;
+            
+            userSessionId = sessionId;
+            userRoomCode = roomCode;
+
+            rooms[roomCode] = {
+              gameState: createInitialGameState(roomCode, sessionId, playerName),
+              clients: { [sessionId]: ws },
+              turnTimer: null,
+            };
+            
+            console.log(`Room ${roomCode} created by ${playerName} (${sessionId})`);
+            ws.send(JSON.stringify({ type: 'ROOM_CREATED', payload: rooms[roomCode].gameState }));
+            break;
+          }
+          
+          case 'JOIN_ROOM': {
+            const { roomCode, sessionId, playerName } = payload;
+            const room = rooms[roomCode];
+            
+            if (!room) {
+              ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Room not found.', fatal: true } }));
+              return;
+            }
+            if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
+                ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Room is full.', fatal: true } }));
+                return;
+            }
+            if (room.gameState.players.find(p => p.id === sessionId)) {
+                // Player is rejoining, just update their websocket client
+                room.clients[sessionId] = ws;
+            } else {
+                 const newPlayer = {
+                    id: sessionId, name: playerName, budget: STARTING_BUDGET,
+                    squad: [], isHost: false, isReady: false, readyForAuction: false,
+                };
+                room.gameState.players.push(newPlayer);
+                room.gameState.lastActionMessage = `${playerName} has joined the lobby.`;
+                room.clients[sessionId] = ws;
+            }
+
+            userSessionId = sessionId;
+            userRoomCode = roomCode;
+            
+            console.log(`${playerName} (${sessionId}) joined room ${roomCode}`);
+            ws.send(JSON.stringify({ type: 'JOIN_SUCCESS', payload: room.gameState }));
+            broadcastGameState(roomCode);
+            break;
+          }
+          
+          case 'DRAW_PLAYERS': {
+            const room = rooms[userRoomCode];
+            if (room) {
+                drawPlayersLogic(userRoomCode);
+                broadcastGameState(userRoomCode);
+            }
+            break;
+          }
+
+          case 'START_GAME': {
+            const room = rooms[userRoomCode];
+            if (room) startAuctionLogic(userRoomCode);
+            break;
+          }
+          
+          case 'TOGGLE_READY': {
+              const room = rooms[userRoomCode];
+              if (room) {
+                  const player = room.gameState.players.find(p => p.id === userSessionId);
+                  if (player) {
+                      player.isReady = !player.isReady;
+                      broadcastGameState(userRoomCode);
+                  }
+              }
+              break;
+          }
+          
+          case 'TOGGLE_READY_FOR_AUCTION': {
+              const room = rooms[userRoomCode];
+              if (room) {
+                  const player = room.gameState.players.find(p => p.id === userSessionId);
+                  if (player) {
+                      player.readyForAuction = !player.readyForAuction;
+                      broadcastGameState(userRoomCode);
+                  }
+              }
+              break;
+          }
+          
+          case 'PLACE_BID': {
+              const room = rooms[userRoomCode];
+              if (room && room.gameState.activePlayerId === userSessionId) {
+                  const bidder = room.gameState.players.find(p => p.id === userSessionId);
+                  const increment = getBidIncrement(room.gameState.currentBid);
+                  const newBid = room.gameState.currentBid + increment;
+
+                  if (bidder.budget >= newBid) {
+                      room.gameState.currentBid = newBid;
+                      room.gameState.highestBidderId = userSessionId;
+                      room.gameState.lastActionMessage = `${bidder.name} bids ${newBid}!`;
+                      advanceTurn(userRoomCode);
+                  }
+              }
+              break;
+          }
+          
+          case 'PASS_TURN': {
+              const room = rooms[userRoomCode];
+              if (room && room.gameState.activePlayerId === userSessionId) {
+                const player = room.gameState.players.find(p => p.id === userSessionId);
+                room.gameState.lastActionMessage = `${player.name} passed the turn.`;
+                advanceTurn(userRoomCode);
+              }
+              break;
+          }
+          
+          case 'DROP_FROM_ROUND': {
+              const room = rooms[userRoomCode];
+              if (room && room.gameState.activePlayerId === userSessionId) {
+                  const player = room.gameState.players.find(p => p.id === userSessionId);
+                  room.gameState.lastActionMessage = `${player.name} dropped from the round.`;
+                  room.gameState.playersInRound = room.gameState.playersInRound.filter(id => id !== userSessionId);
+
+                  if (room.gameState.playersInRound.length <= 1) {
+                      endRoundLogic(userRoomCode);
+                  } else {
+                      advanceTurn(userRoomCode);
+                  }
+              }
+              break;
+          }
+
+          case 'CONTINUE_TO_NEXT_SUBPOOL': {
+            const room = rooms[userRoomCode];
+            if (room) continueToNextSubPoolLogic(userRoomCode);
+            break;
+          }
+        }
+    } catch (error) {
+        console.error('Failed to process message:', message, error);
+    }
+  });
+
+  ws.on('close', () => {
+    if (userRoomCode && userSessionId) {
+      const room = rooms[userRoomCode];
+      if (!room) return;
+      
+      delete room.clients[userSessionId];
+      const disconnectedPlayer = room.gameState.players.find(p => p.id === userSessionId);
+      if(!disconnectedPlayer) return;
+      
+      room.gameState.players = room.gameState.players.filter(p => p.id !== userSessionId);
+      console.log(`Player ${disconnectedPlayer.name} disconnected from room ${userRoomCode}`);
+      
+      if (room.gameState.players.length === 0) {
+        console.log(`Room ${userRoomCode} is empty, deleting.`);
+        if (room.turnTimer) clearTimeout(room.turnTimer);
+        delete rooms[userRoomCode];
+      } else {
+        if (disconnectedPlayer.isHost) {
+            const newHost = room.gameState.players[0];
+            if (newHost) {
+                newHost.isHost = true;
+                newHost.isReady = true;
+                newHost.readyForAuction = true;
+                room.gameState.lastActionMessage = `${disconnectedPlayer.name} (Host) disconnected. ${newHost.name} is the new host.`;
+            }
+        } else {
+             room.gameState.lastActionMessage = `${disconnectedPlayer.name} has left the game.`;
+        }
+        broadcastGameState(userRoomCode);
       }
     }
-  }
-};
-
-const broadcastGameState = (roomCode) => {
-  const room = rooms.get(roomCode);
-  if (room) {
-    broadcast(roomCode, { type: 'GAME_STATE_UPDATE', payload: room.gameState });
-  }
-};
-
-const sendError = (ws, message, fatal = false) => {
-  ws.send(JSON.stringify({ type: 'ERROR', payload: { message, fatal } }));
-};
-
-const gameTimers = new Map(); // K: roomCode, V: { timers } to manage game loop timeouts
-
-const clearTimersForRoom = (roomCode) => {
-    const timers = gameTimers.get(roomCode);
-    if (timers) {
-        if (timers.roundEndTimer) clearTimeout(timers.roundEndTimer);
-        if (timers.nextRoundTimer) clearTimeout(timers.nextRoundTimer);
-        gameTimers.delete(roomCode);
-    }
-};
-
-
-// --- GAME LOGIC (ported from client reducer) ---
-const gameLogic = {
-    DRAW_PLAYERS: (room) => {
-        const { gameState } = room;
-        if (cricketersMasterList.length < TOTAL_PLAYERS_TO_AUCTION) {
-            gameState.lastActionMessage = `Error: Requires at least ${TOTAL_PLAYERS_TO_AUCTION} cricketers, found only ${cricketersMasterList.length}.`; return;
-        }
-        
-        const rolePools = {
-            [CricketerRole.Batsman]: shuffleArray(cricketersMasterList.filter(p => p.role === CricketerRole.Batsman)),
-            [CricketerRole.Bowler]: shuffleArray(cricketersMasterList.filter(p => p.role === CricketerRole.Bowler)),
-            [CricketerRole.AllRounder]: shuffleArray(cricketersMasterList.filter(p => p.role === CricketerRole.AllRounder)),
-            [CricketerRole.WicketKeeper]: shuffleArray(cricketersMasterList.filter(p => p.role === CricketerRole.WicketKeeper)),
-        };
-
-        const subPools = {
-            'Batters-1': rolePools[CricketerRole.Batsman].slice(0, 8), 'Batters-2': rolePools[CricketerRole.Batsman].slice(8, 17),
-            'Bowlers-1': rolePools[CricketerRole.Bowler].slice(0, 7), 'Bowlers-2': rolePools[CricketerRole.Bowler].slice(7, 15),
-            'All-rounders-1': rolePools[CricketerRole.AllRounder].slice(0, 6), 'All-rounders-2': rolePools[CricketerRole.AllRounder].slice(6, 13), 'All-rounders-3': rolePools[CricketerRole.AllRounder].slice(13, 20),
-            'Wicket-Keepers': rolePools[CricketerRole.WicketKeeper].slice(0, 8),
-        };
-        
-        // FIX: Use `readyForAuction` for the auction pool view and reset for all players.
-        gameState.players.forEach(p => p.readyForAuction = false);
-        gameState.gameStatus = 'AUCTION_POOL_VIEW';
-        gameState.subPools = subPools;
-        gameState.lastActionMessage = 'Player sub-pools have been drawn!';
-    },
-    START_GAME: (room) => {
-        const { gameState } = room;
-        const subPoolNames = shuffleArray(Object.keys(gameState.subPools));
-        const finalAuctionPool = subPoolNames.reduce((acc, poolName) => {
-            const shuffledPlayersInPool = shuffleArray(gameState.subPools[poolName]);
-            return [...acc, ...shuffledPlayersInPool];
-        }, []);
-
-        gameState.gameStatus = 'AUCTION';
-        gameState.auctionPool = finalAuctionPool;
-        gameState.subPoolOrder = subPoolNames;
-        gameState.lastActionMessage = 'Auction has started! Good luck!';
-        
-        // Start the first round
-        gameLogic.START_NEXT_ROUND(room);
-    },
-    START_NEXT_ROUND: (room) => {
-        const { gameState } = room;
-        
-        if (gameState.auctionPool.length === 0) {
-            gameState.gameStatus = 'GAME_OVER';
-            gameState.lastActionMessage = "The auction is over!";
-            return;
-        }
-
-        const nextCricketer = gameState.auctionPool[0];
-        const remainingPool = gameState.auctionPool.slice(1);
-        
-        let currentSubPoolName = gameState.currentSubPoolName;
-        let currentSubPoolPlayers = gameState.currentSubPoolPlayers;
-        if (!currentSubPoolPlayers.some(p => p.id === nextCricketer.id)) {
-            for (const [name, playersInPool] of Object.entries(gameState.subPools)) {
-                if (playersInPool.some(p => p.id === nextCricketer.id)) {
-                    currentSubPoolName = name;
-                    currentSubPoolPlayers = playersInPool;
-                    break;
-                }
-            }
-        }
-        
-        // Check for subpool break
-        const allInCurrentPoolAuctioned = gameState.currentSubPoolPlayers.every(p => gameState.auctionHistory.some(h => h.cricketer.id === p.id));
-        if (gameState.currentSubPoolName && allInCurrentPoolAuctioned && currentSubPoolName !== gameState.currentSubPoolName) {
-            gameState.gameStatus = 'SUBPOOL_BREAK';
-            gameState.nextSubPoolName = currentSubPoolName;
-            gameState.nextSubPoolPlayers = currentSubPoolPlayers;
-            gameState.lastActionMessage = `Sub-pool '${gameState.currentSubPoolName}' has ended.`;
-            return;
-        }
-
-        const playersWithBudget = gameState.players.filter(p => p.budget >= nextCricketer.basePrice).map(p => p.id);
-        
-        if (playersWithBudget.length < 2) {
-             const winner = gameState.players.find(p => p.id === playersWithBudget[0]);
-             if (winner) {
-                 winner.budget -= nextCricketer.basePrice;
-                 winner.squad.push(nextCricketer);
-                 gameState.auctionPool = remainingPool;
-                 gameState.auctionHistory.push({ cricketer: nextCricketer, winningBid: nextCricketer.basePrice, winnerId: winner.id });
-                 gameState.lastActionMessage = `${winner.name} wins ${nextCricketer.name} uncontested!`;
-             } else {
-                 // Unsold if no one can afford base price
-                 gameState.auctionPool = remainingPool;
-                 gameState.auctionHistory.push({ cricketer: nextCricketer, winningBid: 0, winnerId: 'UNSOLD' });
-                 gameState.lastActionMessage = `${nextCricketer.name} was unsold.`;
-             }
-             // Immediately queue up the next round after an uncontested sale.
-             const nextRoundTimer = setTimeout(() => {
-                 gameLogic.START_NEXT_ROUND(room);
-                 broadcastGameState(room.gameState.roomCode);
-             }, 1500);
-             gameTimers.set(room.gameState.roomCode, { ...gameTimers.get(room.gameState.roomCode), nextRoundTimer });
-             return;
-        }
-
-        const roundOrder = [...gameState.masterBiddingOrder.slice(gameState.startingPlayerIndex), ...gameState.masterBiddingOrder.slice(0, gameState.startingPlayerIndex)];
-        const activeBiddingOrder = roundOrder.filter(id => playersWithBudget.includes(id));
-        
-        gameState.gameStatus = 'AUCTION';
-        gameState.currentPlayerForAuction = nextCricketer;
-        gameState.auctionPool = remainingPool;
-        gameState.currentBid = nextCricketer.basePrice;
-        gameState.highestBidderId = null;
-        gameState.biddingOrder = activeBiddingOrder;
-        gameState.playersInRound = activeBiddingOrder;
-        gameState.activePlayerId = activeBiddingOrder[0] || '';
-        gameState.startingPlayerIndex = (gameState.startingPlayerIndex + 1) % gameState.masterBiddingOrder.length;
-        gameState.lastActionMessage = `${nextCricketer.name} is up for auction!`;
-        gameState.currentSubPoolName = currentSubPoolName;
-        gameState.currentSubPoolPlayers = currentSubPoolPlayers;
-    },
-    PLACE_BID: (room, { sessionId }) => {
-        const { gameState } = room;
-        if (gameState.activePlayerId !== sessionId) return;
-
-        const bidder = gameState.players.find(p => p.id === sessionId);
-        const increment = getBidIncrement(gameState.currentBid);
-        const newBid = gameState.currentBid + increment;
-
-        if (bidder.budget < newBid) {
-            gameState.lastActionMessage = `${bidder.name} doesn't have enough budget!`; return;
-        }
-
-        const currentIndex = gameState.biddingOrder.indexOf(gameState.activePlayerId);
-        let nextIndex = currentIndex;
-        do {
-            nextIndex = (nextIndex + 1) % gameState.biddingOrder.length;
-        } while (!gameState.playersInRound.includes(gameState.biddingOrder[nextIndex]));
-        
-        gameState.currentBid = newBid;
-        gameState.highestBidderId = bidder.id;
-        gameState.activePlayerId = gameState.biddingOrder[nextIndex];
-        gameState.lastActionMessage = `${bidder.name} bids ${newBid}!`;
-
-        checkRoundEnd(room);
-    },
-    PASS_TURN: (room, { sessionId }) => {
-        const { gameState } = room;
-        if (gameState.activePlayerId !== sessionId) return;
-
-        const currentIndex = gameState.biddingOrder.indexOf(gameState.activePlayerId);
-        let nextIndex = currentIndex;
-        do {
-            nextIndex = (nextIndex + 1) % gameState.biddingOrder.length;
-        } while (!gameState.playersInRound.includes(gameState.biddingOrder[nextIndex]));
-
-        gameState.activePlayerId = gameState.biddingOrder[nextIndex];
-        gameState.lastActionMessage = `${gameState.players.find(p => p.id === sessionId)?.name} passes.`;
-
-        checkRoundEnd(room);
-    },
-    DROP_FROM_ROUND: (room, { sessionId }) => {
-        const { gameState } = room;
-        if (!gameState.playersInRound.includes(sessionId)) return;
-
-        gameState.playersInRound = gameState.playersInRound.filter(id => id !== sessionId);
-        gameState.lastActionMessage = `${gameState.players.find(p => p.id === sessionId)?.name} has dropped.`;
-
-        if (gameState.activePlayerId === sessionId) {
-            const currentIndex = gameState.biddingOrder.indexOf(gameState.activePlayerId);
-            let nextIndex = currentIndex;
-            do {
-                nextIndex = (nextIndex + 1) % gameState.biddingOrder.length;
-            } while (gameState.playersInRound.length > 0 && !gameState.playersInRound.includes(gameState.biddingOrder[nextIndex]));
-            gameState.activePlayerId = gameState.playersInRound.length > 0 ? gameState.biddingOrder[nextIndex] : '';
-        }
-
-        checkRoundEnd(room);
-    },
-    END_ROUND: (room) => {
-        const { gameState } = room;
-        const { currentPlayerForAuction, playersInRound, highestBidderId, currentBid } = gameState;
-        if (!currentPlayerForAuction) return;
-
-        let winnerId = playersInRound.length === 1 ? playersInRound[0] : highestBidderId;
-        let winningBid = currentBid;
-        
-        if (playersInRound.length === 1 && !highestBidderId) {
-            winningBid = currentPlayerForAuction.basePrice;
-        }
-
-        const winner = gameState.players.find(p => p.id === winnerId);
-        if (winner && winner.budget >= winningBid) {
-            winner.budget -= winningBid;
-            winner.squad.push(currentPlayerForAuction);
-            gameState.auctionHistory.push({ cricketer: currentPlayerForAuction, winningBid, winnerId: winner.id });
-            gameState.lastActionMessage = `${winner.name} wins ${currentPlayerForAuction.name} for ${winningBid}!`;
-        } else {
-            // Unsold
-            gameState.auctionHistory.push({ cricketer: currentPlayerForAuction, winningBid: 0, winnerId: 'UNSOLD' });
-            gameState.lastActionMessage = winner ? `${winner.name} couldn't afford their bid! ${currentPlayerForAuction.name} is unsold.` : `${currentPlayerForAuction.name} was unsold.`;
-        }
-
-        gameState.gameStatus = 'ROUND_OVER';
-        gameState.currentPlayerForAuction = null;
-
-        // Schedule the next round to start after a delay
-        const nextRoundTimer = setTimeout(() => {
-            gameLogic.START_NEXT_ROUND(room);
-            broadcastGameState(room.gameState.roomCode);
-        }, ROUND_OVER_DURATION_MS);
-        gameTimers.set(room.gameState.roomCode, { ...gameTimers.get(room.gameState.roomCode), nextRoundTimer });
-    }
-};
-
-const checkRoundEnd = (room) => {
-    const { gameState } = room;
-    if (gameState.playersInRound.length <= 1) {
-        clearTimersForRoom(room.gameState.roomCode);
-        const roundEndTimer = setTimeout(() => {
-            gameLogic.END_ROUND(room);
-            broadcastGameState(room.gameState.roomCode);
-        }, 1500);
-        gameTimers.set(room.gameState.roomCode, { ...gameTimers.get(room.gameState.roomCode), roundEndTimer });
-    }
-};
-
-// --- WEBSOCKET SERVER LOGIC ---
-wss.on('connection', (ws) => {
-    console.log('Client connected');
-    ws.on('message', (message) => {
-        try {
-            const { type, payload } = JSON.parse(message);
-            console.log(`Received message: ${type}`);
-
-            // --- ROOM MANAGEMENT ---
-            if (type === 'CREATE_ROOM') {
-                const { sessionId, playerName } = payload;
-                const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-                
-                // FIX: Add readyForAuction to the player object.
-                const hostPlayer = { id: sessionId, name: playerName, budget: STARTING_BUDGET, squad: [], isHost: true, isReady: true, readyForAuction: false };
-
-                const newGameState = {
-                    gameStatus: 'LOBBY',
-                    roomCode,
-                    players: [hostPlayer],
-                    auctionPool: [],
-                    subPools: {},
-                    cricketersMasterList: [], // Will be loaded async
-                    currentPlayerForAuction: null,
-                    auctionHistory: [],
-                    currentBid: 0,
-                    highestBidderId: null,
-                    activePlayerId: '',
-                    masterBiddingOrder: [sessionId],
-                    biddingOrder: [],
-                    startingPlayerIndex: 0,
-                    playersInRound: [],
-                    lastActionMessage: 'Welcome! Share the room code to invite players.',
-                    isLoading: false,
-                };
-
-                const room = {
-                    gameState: newGameState,
-                    clients: new Map([[sessionId, ws]])
-                };
-                rooms.set(roomCode, room);
-                ws.sessionId = sessionId;
-                ws.roomCode = roomCode;
-
-                ws.send(JSON.stringify({ type: 'ROOM_CREATED', payload: newGameState }));
-                return;
-            }
-
-            if (type === 'JOIN_ROOM') {
-                const { sessionId, playerName, roomCode } = payload;
-                const room = rooms.get(roomCode);
-                if (!room) {
-                    sendError(ws, 'Room not found.', true);
-                    return;
-                }
-                if (room.clients.has(sessionId)){
-                     // Reconnecting client
-                     room.clients.set(sessionId, ws);
-                } else {
-                     // New client
-                    if (room.gameState.players.length >= 4) {
-                        sendError(ws, 'Room is full.', true); return;
-                    }
-                    let finalName = playerName;
-                    const existingNames = new Set(room.gameState.players.map(p => p.name));
-                    let suffix = 1;
-                    while (existingNames.has(finalName)) {
-                        finalName = `${playerName}-${suffix++}`;
-                    }
-
-                    // FIX: Add readyForAuction to the player object.
-                    const newPlayer = { id: sessionId, name: finalName, budget: STARTING_BUDGET, squad: [], isHost: false, isReady: false, readyForAuction: false };
-                    room.gameState.players.push(newPlayer);
-                    room.gameState.masterBiddingOrder.push(sessionId);
-                    room.clients.set(sessionId, ws);
-                }
-                
-                ws.sessionId = sessionId;
-                ws.roomCode = roomCode;
-                
-                // Send success message to joining client with the full state
-                ws.send(JSON.stringify({ type: 'JOIN_SUCCESS', payload: room.gameState }));
-                // Broadcast updated state to everyone else
-                broadcastGameState(roomCode);
-                return;
-            }
-            
-            // --- IN-GAME ACTIONS ---
-            const { roomCode, sessionId } = ws;
-            const room = rooms.get(roomCode);
-            if (!room) return; // Ignore messages from clients not in a room
-
-            const player = room.gameState.players.find(p => p.id === sessionId);
-            if (!player) return; // Ignore messages from non-players
-
-            const isHost = player.isHost;
-
-            switch(type) {
-                case 'TOGGLE_READY':
-                    if (room.gameState.gameStatus === 'LOBBY') {
-                        player.isReady = !player.isReady;
-                        broadcastGameState(roomCode);
-                    }
-                    break;
-                case 'TOGGLE_READY_FOR_AUCTION':
-                     if (room.gameState.gameStatus === 'AUCTION_POOL_VIEW') {
-                        // FIX: Toggle `readyForAuction` instead of `isReady`.
-                        player.readyForAuction = !player.readyForAuction;
-                        broadcastGameState(roomCode);
-                    }
-                    break;
-                case 'DRAW_PLAYERS':
-                    if (isHost) {
-                        gameLogic.DRAW_PLAYERS(room);
-                        broadcastGameState(roomCode);
-                    }
-                    break;
-                case 'START_GAME':
-                    if (isHost) {
-                        gameLogic.START_GAME(room);
-                        broadcastGameState(roomCode);
-                    }
-                    break;
-                 case 'CONTINUE_TO_NEXT_SUBPOOL':
-                    if (isHost) {
-                        clearTimersForRoom(roomCode);
-                        gameLogic.START_NEXT_ROUND(room);
-                        broadcastGameState(roomCode);
-                    }
-                    break;
-                case 'PLACE_BID':
-                    gameLogic.PLACE_BID(room, { sessionId });
-                    broadcastGameState(roomCode);
-                    break;
-                case 'PASS_TURN':
-                    gameLogic.PASS_TURN(room, { sessionId });
-                    broadcastGameState(roomCode);
-                    break;
-                case 'DROP_FROM_ROUND':
-                    gameLogic.DROP_FROM_ROUND(room, { sessionId });
-                    broadcastGameState(roomCode);
-                    break;
-            }
-
-        } catch (error) {
-            console.error('Failed to handle message:', error);
-        }
-    });
-
-    ws.on('close', () => {
-        console.log('Client disconnected');
-        const { roomCode, sessionId } = ws;
-        const room = rooms.get(roomCode);
-        if (room) {
-            room.clients.delete(sessionId);
-            // Don't remove player data, allows for reconnect
-            // If host disconnects, a new host should be assigned, but for now we'll keep it simple
-            if (room.clients.size === 0) {
-                console.log(`Room ${roomCode} is empty, deleting.`);
-                clearTimersForRoom(roomCode);
-                rooms.delete(roomCode);
-            } else {
-                 broadcastGameState(roomCode); // Notify others of disconnection (e.g., UI could show them as 'offline')
-            }
-        }
-    });
+  });
 });
 
-const fetchCricketers = async () => {
-    console.log('Fetching master cricketer list from Supabase...');
-    const { data, error } = await supabase.from('cricketers').select('*');
-    if (error) {
-        console.error("CRITICAL: Could not fetch cricketers from Supabase.", error);
-    } else if (data) {
-        cricketersMasterList = data.map((item) => {
-            let role = null;
-            const roleStr = item.ROLE?.trim().toLowerCase();
-            if (['batsman', 'batter'].includes(roleStr)) role = CricketerRole.Batsman;
-            else if (roleStr === 'bowler') role = CricketerRole.Bowler;
-            else if (roleStr === 'all-rounder') role = CricketerRole.AllRounder;
-            else if (['wicket-keeper', 'wk'].includes(roleStr)) role = CricketerRole.WicketKeeper;
-            if (!role) return null;
-
-            return {
-                id: item.id, name: item.Name, role, basePrice: item.base_price || 50, image: item.image,
-                overall: item.OVR || 0, battingOVR: item['Batting OVR'] || 0,
-                bowlingOVR: item['Bowling OVR'] || 0, fieldingOVR: item['Fielding OVR'] || 0,
-            };
-        }).filter(Boolean);
-        console.log(`Successfully fetched ${cricketersMasterList.length} cricketers.`);
-    }
-};
-
 server.listen(PORT, async () => {
-    await fetchCricketers();
-    console.log(`Server is listening on port ${PORT}`);
+  await fetchCricketers();
+  console.log(`Server is listening on http://localhost:${PORT}`);
 });
