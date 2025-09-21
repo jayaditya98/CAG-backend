@@ -99,6 +99,19 @@ const shuffleArray = (array) => {
   }
 };
 
+/**
+ * Maps database-specific role names to the application's standard role names.
+ * @param {string} dbRole The role name from the database (e.g., 'batter', 'wk').
+ * @returns {string} The application-standard role name (e.g., 'Batsman', 'Wicket-Keeper').
+ */
+const mapDbRoleToGameRole = (dbRole) => {
+  switch (dbRole) {
+    case 'batter': return 'Batsman';
+    case 'wk': return 'Wicket-Keeper';
+    default: return dbRole; // Assumes 'Bowler' and 'All-Rounder' match
+  }
+};
+
 
 // --- Core Game Logic Functions ---
 
@@ -117,7 +130,7 @@ const fetchCricketers = async () => {
   cricketersMasterList = data.map(c => ({
     id: c.id,
     name: c.Name,
-    role: c.ROLE,
+    role: mapDbRoleToGameRole(c.ROLE),
     basePrice: c.base_price,
     image: c.image,
     overall: c.OVR,
