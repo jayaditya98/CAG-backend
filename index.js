@@ -349,6 +349,13 @@ const nextPlayerLogic = (roomCode) => {
         room.gameState.currentSubPoolPlayers = currentPool || [];
         room.gameState.nextSubPoolPlayers = room.gameState.subPools[nextPoolName];
         
+        // Reset readiness for the next sub-pool
+        room.gameState.players.forEach(p => {
+            if (!p.isHost) {
+                p.isReady = false;
+            }
+        });
+        
         broadcastGameState(roomCode);
         return;
     }
@@ -376,7 +383,7 @@ const nextPlayerLogic = (roomCode) => {
     room.gameState.startingPlayerIndex = (startIndex + 1) % masterOrder.length;
 
     if (room.turnTimer) clearTimeout(room.turnTimer);
-    room.turnTimer = setTimeout(() => advanceTurn(roomCode, true), TURN_DURATION_SECONDS * 1000);
+    room.turnTimer = setTimeout(() => advanceTurn(roomCode, room.gameState.activePlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
 
     broadcastGameState(roomCode);
 };
@@ -404,7 +411,7 @@ const continueToNextSubPoolLogic = (roomCode) => {
 /**
  * Ends the bidding round for a player.
  */
-const endRoundLogic = (roomCode, wasUnsold = false) => {
+const endRoundLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room || room.gameState.gameStatus === 'ROUND_OVER') return;
     
@@ -414,7 +421,8 @@ const endRoundLogic = (roomCode, wasUnsold = false) => {
     let winnerId = 'UNSOLD';
     let winningBid = 0;
 
-    if (!wasUnsold && highestBidderId) {
+    // A winner exists if there is a highest bidder and at least one person was left in the round.
+    if (highestBidderId && room.gameState.playersInRound.includes(highestBidderId)) {
         const winner = room.gameState.players.find(p => p.id === highestBidderId);
         if (winner) {
             winner.budget -= currentBid;
@@ -440,50 +448,74 @@ const endRoundLogic = (roomCode, wasUnsold = false) => {
 };
 
 /**
- * Advances the turn to the next player.
- * @param {boolean} wasAutoPass - True if the turn advanced due to timeout.
+ * Core logic for advancing the turn or ending the round based on player actions.
+ * @param {string} roomCode - The room code.
+ * @param {string} actionPlayerId - The ID of the player who acted or timed out.
+ * @param {'BID' | 'PASS' | 'DROP' | 'TIMEOUT'} actionType - The type of action taken.
  */
-const advanceTurn = (roomCode, wasAutoPass = false) => {
+const advanceTurn = (roomCode, actionPlayerId, actionType) => {
     const room = rooms[roomCode];
     if (!room || room.gameState.gameStatus !== 'AUCTION') return;
     
     if (room.turnTimer) clearTimeout(room.turnTimer);
 
-    const { biddingOrder, playersInRound } = room.gameState;
+    const { biddingOrder, playersInRound, highestBidderId } = room.gameState;
     
-    if (playersInRound.length <= 1) {
+    // Handle DROP or TIMEOUT by removing the player from the round
+    if (actionType === 'DROP' || actionType === 'TIMEOUT') {
+        room.gameState.playersInRound = playersInRound.filter(id => id !== actionPlayerId);
+        
+        const timedOutPlayer = room.gameState.players.find(p => p.id === actionPlayerId);
+        if (timedOutPlayer) {
+            if (actionType === 'TIMEOUT') {
+                room.gameState.lastActionMessage = `${timedOutPlayer.name} timed out and dropped from the round.`;
+            } else {
+                room.gameState.lastActionMessage = `${timedOutPlayer.name} dropped from the round.`;
+            }
+        }
+    }
+
+    // Check for round-ending conditions
+    // Condition 1: Only one player is left in the round. They automatically win if they are the highest bidder, otherwise player is unsold.
+    if (room.gameState.playersInRound.length <= 1) {
         endRoundLogic(roomCode);
         return;
     }
 
-    const currentActiveIndex = biddingOrder.indexOf(room.gameState.activePlayerId);
-    
-    if(wasAutoPass) {
-        const timedOutPlayerId = room.gameState.activePlayerId;
-        room.gameState.playersInRound = playersInRound.filter(id => id !== timedOutPlayerId);
-        const timedOutPlayer = room.gameState.players.find(p=>p.id === timedOutPlayerId);
-        if (timedOutPlayer) {
-            room.gameState.lastActionMessage = `${timedOutPlayer.name} timed out and dropped from the round.`;
-        }
-        if (room.gameState.playersInRound.length <= 1) {
-            endRoundLogic(roomCode);
-            return;
-        }
+    // Find the current player's position in the overall bidding order
+    const currentActiveIndex = biddingOrder.indexOf(actionPlayerId);
+    if (currentActiveIndex === -1) {
+        // This can happen if a player not in the bidding order tries to act, just end the round to be safe
+        endRoundLogic(roomCode);
+        return;
     }
 
+    // Find the next player in order who is still in the round
     let nextIndex = (currentActiveIndex + 1) % biddingOrder.length;
-    while (!room.gameState.playersInRound.includes(biddingOrder[nextIndex])) {
+    let nextPlayerId = biddingOrder[nextIndex];
+    let loopDetector = 0; // Failsafe to prevent infinite loops
+
+    while (!room.gameState.playersInRound.includes(nextPlayerId) && loopDetector < biddingOrder.length) {
         nextIndex = (nextIndex + 1) % biddingOrder.length;
-        if (biddingOrder[nextIndex] === room.gameState.activePlayerId) {
-             // We've looped all the way around, something is wrong, end the round
-            endRoundLogic(roomCode);
-            return;
-        }
+        nextPlayerId = biddingOrder[nextIndex];
+        loopDetector++;
+    }
+
+    // Condition 2: The turn has come back around to the highest bidder. They win.
+    if (highestBidderId && nextPlayerId === highestBidderId) {
+        endRoundLogic(roomCode);
+        return;
     }
     
-    room.gameState.activePlayerId = biddingOrder[nextIndex];
+    // Condition 3: If we looped through everyone and didn't find a next player (e.g., everyone dropped)
+    if (loopDetector >= biddingOrder.length) {
+        endRoundLogic(roomCode);
+        return;
+    }
 
-    room.turnTimer = setTimeout(() => advanceTurn(roomCode, true), TURN_DURATION_SECONDS * 1000);
+    // If no end condition is met, advance the turn
+    room.gameState.activePlayerId = nextPlayerId;
+    room.turnTimer = setTimeout(() => advanceTurn(roomCode, room.gameState.activePlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
     
     broadcastGameState(roomCode);
 };
@@ -501,6 +533,13 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
         const { type, payload } = JSON.parse(message);
+        const room = rooms[userRoomCode];
+        const player = room ? room.gameState.players.find(p => p.id === userSessionId) : null;
+
+        // Basic validation
+        if (type !== 'CREATE_ROOM' && type !== 'JOIN_ROOM' && (!room || !player)) {
+            return;
+        }
 
         switch (type) {
           case 'CREATE_ROOM': {
@@ -523,41 +562,40 @@ wss.on('connection', (ws) => {
           
           case 'JOIN_ROOM': {
             const { roomCode, sessionId, playerName } = payload;
-            const room = rooms[roomCode];
+            const joinRoom = rooms[roomCode];
             
-            if (!room) {
+            if (!joinRoom) {
               ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Room not found.', fatal: true } }));
               return;
             }
-            if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
+            if (joinRoom.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
                 ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Room is full.', fatal: true } }));
                 return;
             }
-            if (room.gameState.players.find(p => p.id === sessionId)) {
+            if (joinRoom.gameState.players.find(p => p.id === sessionId)) {
                 // Player is rejoining, just update their websocket client
-                room.clients[sessionId] = ws;
+                joinRoom.clients[sessionId] = ws;
             } else {
                  const newPlayer = {
                     id: sessionId, name: playerName, budget: STARTING_BUDGET,
                     squad: [], isHost: false, isReady: false, readyForAuction: false,
                 };
-                room.gameState.players.push(newPlayer);
-                room.gameState.lastActionMessage = `${playerName} has joined the lobby.`;
-                room.clients[sessionId] = ws;
+                joinRoom.gameState.players.push(newPlayer);
+                joinRoom.gameState.lastActionMessage = `${playerName} has joined the lobby.`;
+                joinRoom.clients[sessionId] = ws;
             }
 
             userSessionId = sessionId;
             userRoomCode = roomCode;
             
             console.log(`${playerName} (${sessionId}) joined room ${roomCode}`);
-            ws.send(JSON.stringify({ type: 'JOIN_SUCCESS', payload: room.gameState }));
+            ws.send(JSON.stringify({ type: 'JOIN_SUCCESS', payload: joinRoom.gameState }));
             broadcastGameState(roomCode);
             break;
           }
           
           case 'DRAW_PLAYERS': {
-            const room = rooms[userRoomCode];
-            if (room) {
+            if (player.isHost) {
                 drawPlayersLogic(userRoomCode);
                 broadcastGameState(userRoomCode);
             }
@@ -565,39 +603,29 @@ wss.on('connection', (ws) => {
           }
 
           case 'START_GAME': {
-            const room = rooms[userRoomCode];
-            if (room) startAuctionLogic(userRoomCode);
+            if (player.isHost) startAuctionLogic(userRoomCode);
             break;
           }
           
           case 'TOGGLE_READY': {
-              const room = rooms[userRoomCode];
-              if (room) {
-                  const player = room.gameState.players.find(p => p.id === userSessionId);
-                  if (player) {
-                      player.isReady = !player.isReady;
-                      broadcastGameState(userRoomCode);
-                  }
+              if (player) {
+                  player.isReady = !player.isReady;
+                  broadcastGameState(userRoomCode);
               }
               break;
           }
           
           case 'TOGGLE_READY_FOR_AUCTION': {
-              const room = rooms[userRoomCode];
-              if (room) {
-                  const player = room.gameState.players.find(p => p.id === userSessionId);
-                  if (player) {
-                      player.readyForAuction = !player.readyForAuction;
-                      broadcastGameState(userRoomCode);
-                  }
+              if (player) {
+                  player.readyForAuction = !player.readyForAuction;
+                  broadcastGameState(userRoomCode);
               }
               break;
           }
           
           case 'PLACE_BID': {
-              const room = rooms[userRoomCode];
-              if (room && room.gameState.activePlayerId === userSessionId) {
-                  const bidder = room.gameState.players.find(p => p.id === userSessionId);
+              if (room.gameState.activePlayerId === userSessionId) {
+                  const bidder = player;
                   const increment = getBidIncrement(room.gameState.currentBid);
                   const newBid = room.gameState.currentBid + increment;
 
@@ -605,41 +633,35 @@ wss.on('connection', (ws) => {
                       room.gameState.currentBid = newBid;
                       room.gameState.highestBidderId = userSessionId;
                       room.gameState.lastActionMessage = `${bidder.name} bids ${newBid}!`;
-                      advanceTurn(userRoomCode);
+                      advanceTurn(userRoomCode, userSessionId, 'BID');
                   }
               }
               break;
           }
           
           case 'PASS_TURN': {
-              const room = rooms[userRoomCode];
-              if (room && room.gameState.activePlayerId === userSessionId) {
-                const player = room.gameState.players.find(p => p.id === userSessionId);
+              if (room.gameState.activePlayerId === userSessionId) {
                 room.gameState.lastActionMessage = `${player.name} passed the turn.`;
-                advanceTurn(userRoomCode);
+                advanceTurn(userRoomCode, userSessionId, 'PASS');
               }
               break;
           }
           
           case 'DROP_FROM_ROUND': {
-              const room = rooms[userRoomCode];
-              if (room && room.gameState.activePlayerId === userSessionId) {
-                  const player = room.gameState.players.find(p => p.id === userSessionId);
-                  room.gameState.lastActionMessage = `${player.name} dropped from the round.`;
-                  room.gameState.playersInRound = room.gameState.playersInRound.filter(id => id !== userSessionId);
-
-                  if (room.gameState.playersInRound.length <= 1) {
-                      endRoundLogic(userRoomCode);
-                  } else {
-                      advanceTurn(userRoomCode);
-                  }
+              if (room.gameState.activePlayerId === userSessionId) {
+                  advanceTurn(userRoomCode, userSessionId, 'DROP');
               }
               break;
           }
 
           case 'CONTINUE_TO_NEXT_SUBPOOL': {
-            const room = rooms[userRoomCode];
-            if (room) continueToNextSubPoolLogic(userRoomCode);
+            if (player.isHost) {
+                // Server-side check to ensure all non-hosts are ready
+                const allReady = room.gameState.players.every(p => p.isHost || p.isReady);
+                if (allReady) {
+                    continueToNextSubPoolLogic(userRoomCode);
+                }
+            }
             break;
           }
         }
