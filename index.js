@@ -190,6 +190,9 @@ const createInitialGameState = (roomCode, hostSessionId, hostPlayerName) => {
     currentSubPoolPlayers: [],
     nextSubPoolName: '',
     nextSubPoolPlayers: [],
+    // New properties for robust progress tracking
+    currentSubPoolOrderIndex: 0,
+    currentPlayerInSubPoolIndex: -1,
   };
 };
 
@@ -306,43 +309,56 @@ const startAuctionLogic = (roomCode) => {
     shuffleArray(room.gameState.masterBiddingOrder);
     room.gameState.startingPlayerIndex = 0;
     
+    // Initialize auction indices
+    room.gameState.currentSubPoolOrderIndex = 0;
+    room.gameState.currentPlayerInSubPoolIndex = -1; // nextPlayerLogic will increment to 0
+    
     nextPlayerLogic(roomCode);
 };
 
 /**
- * Logic to bring the next player up for auction.
+ * Logic to bring the next player up for auction using indices for robust state.
  */
 const nextPlayerLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
 
-    if (!room.gameState.currentSubPoolName) {
-        room.gameState.currentSubPoolName = room.gameState.subPoolOrder[0];
-    }
+    const nextPlayerIndex = room.gameState.currentPlayerInSubPoolIndex + 1;
     
-    let currentPool = room.gameState.subPools[room.gameState.currentSubPoolName];
-    
-    if (!currentPool || currentPool.length === 0) {
-        const currentPoolIndex = room.gameState.subPoolOrder.indexOf(room.gameState.currentSubPoolName);
-        const nextPoolIndex = currentPoolIndex + 1;
+    const currentSubPoolIndex = room.gameState.currentSubPoolOrderIndex;
+    const currentSubPoolName = room.gameState.subPoolOrder[currentSubPoolIndex];
+    const currentPool = room.gameState.subPools[currentSubPoolName];
 
-        if (nextPoolIndex >= room.gameState.subPoolOrder.length) {
+    // Check if the current sub-pool is finished
+    if (!currentPool || nextPlayerIndex >= currentPool.length) {
+        const nextSubPoolIndex = currentSubPoolIndex + 1;
+
+        // Check if the entire auction is finished
+        if (nextSubPoolIndex >= room.gameState.subPoolOrder.length) {
             room.gameState.gameStatus = 'GAME_OVER';
             room.gameState.lastActionMessage = 'The auction has concluded!';
             broadcastGameState(roomCode);
             return;
         }
 
-        const nextPoolName = room.gameState.subPoolOrder[nextPoolIndex];
+        // Otherwise, prepare for a sub-pool break
+        const nextPoolName = room.gameState.subPoolOrder[nextSubPoolIndex];
         room.gameState.gameStatus = 'SUBPOOL_BREAK';
+        room.gameState.currentSubPoolName = currentSubPoolName;
         room.gameState.nextSubPoolName = nextPoolName;
+        room.gameState.currentSubPoolPlayers = currentPool || [];
         room.gameState.nextSubPoolPlayers = room.gameState.subPools[nextPoolName];
-        room.gameState.currentSubPoolPlayers = room.gameState.subPools[room.gameState.currentSubPoolName] || [];
+        
         broadcastGameState(roomCode);
         return;
     }
 
-    const nextPlayer = currentPool.shift();
+    // If we are here, we have a player to auction in the current pool
+    room.gameState.currentPlayerInSubPoolIndex = nextPlayerIndex;
+    const nextPlayer = currentPool[nextPlayerIndex];
+
+    room.gameState.currentSubPoolName = currentSubPoolName;
+    room.gameState.currentSubPoolPlayers = currentPool;
     room.gameState.currentPlayerForAuction = nextPlayer;
     room.gameState.currentBid = nextPlayer.basePrice;
     room.gameState.highestBidderId = null;
@@ -372,13 +388,16 @@ const continueToNextSubPoolLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
     
-    const currentPoolIndex = room.gameState.subPoolOrder.indexOf(room.gameState.currentSubPoolName);
-    const nextPoolName = room.gameState.subPoolOrder[currentPoolIndex + 1];
+    // Move state to the next pool
+    room.gameState.currentSubPoolOrderIndex++;
+    room.gameState.currentPlayerInSubPoolIndex = -1; // Will be incremented to 0 in nextPlayerLogic
 
-    room.gameState.currentSubPoolName = nextPoolName;
+    // Clear break-related state
     room.gameState.nextSubPoolName = '';
     room.gameState.nextSubPoolPlayers = [];
+    room.gameState.currentSubPoolPlayers = [];
     
+    // Get the first player of the new pool
     nextPlayerLogic(roomCode);
 };
 
