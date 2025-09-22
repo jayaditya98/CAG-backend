@@ -15,6 +15,7 @@ const PRE_AUCTION_DURATION_SECONDS = 10;
 const PRE_ROUND_DURATION_SECONDS = 7;
 const PLAYER_BREAK_DURATION_SECONDS = 5;
 const MAX_PLAYERS_PER_ROOM = 4;
+const MAX_SQUAD_SIZE = 8;
 
 // --- Supabase Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -376,7 +377,7 @@ const nextPlayerLogic = (roomCode) => {
     room.gameState.currentPlayerForAuction = nextPlayer;
     room.gameState.currentBid = nextPlayer.basePrice;
     room.gameState.highestBidderId = null;
-    room.gameState.playersInRound = room.gameState.players.filter(p => p.budget >= nextPlayer.basePrice).map(p => p.id);
+    room.gameState.playersInRound = room.gameState.players.filter(p => p.budget >= nextPlayer.basePrice && p.squad.length < MAX_SQUAD_SIZE).map(p => p.id);
     room.gameState.gameStatus = 'PLAYER_BREAK_TIMER';
     broadcastGameState(roomCode);
 
@@ -391,6 +392,11 @@ const nextPlayerLogic = (roomCode) => {
         const startIndex = currentRoom.gameState.startingPlayerIndex;
         currentRoom.gameState.biddingOrder = [...masterOrder.slice(startIndex), ...masterOrder.slice(0, startIndex)].filter(id => currentRoom.gameState.playersInRound.includes(id));
         
+        if (currentRoom.gameState.biddingOrder.length === 0) {
+            endRoundLogic(roomCode);
+            return;
+        }
+
         currentRoom.gameState.activePlayerId = currentRoom.gameState.biddingOrder[0] || null;
         currentRoom.gameState.startingPlayerIndex = (startIndex + 1) % masterOrder.length;
 
