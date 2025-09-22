@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 8080;
 const STARTING_BUDGET = 10000;
 const TURN_DURATION_SECONDS = 7;
 const ROUND_OVER_DURATION_MS = 4000;
+const PRE_AUCTION_DURATION_SECONDS = 10;
+const PRE_ROUND_DURATION_SECONDS = 7;
 const MAX_PLAYERS_PER_ROOM = 4;
 
 // --- Supabase Setup ---
@@ -275,11 +277,18 @@ const startAuctionLogic = (roomCode) => {
     room.gameState.masterBiddingOrder = room.gameState.players.map(p => p.id);
     shuffleArray(room.gameState.masterBiddingOrder);
     room.gameState.startingPlayerIndex = 0;
-    
     room.gameState.currentSubPoolOrderIndex = 0;
     room.gameState.currentPlayerInSubPoolIndex = -1;
     
-    nextPlayerLogic(roomCode);
+    room.gameState.gameStatus = 'PRE_AUCTION_TIMER';
+    broadcastGameState(roomCode);
+
+    setTimeout(() => {
+        const currentRoom = rooms[roomCode];
+        if (currentRoom) {
+            nextPlayerLogic(roomCode);
+        }
+    }, PRE_AUCTION_DURATION_SECONDS * 1000);
 };
 
 const nextPlayerLogic = (roomCode) => {
@@ -386,18 +395,26 @@ const continueToNextSubPoolLogic = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
     
-    if (room.gameState.isSecondRound && room.gameState.currentSubPoolOrderIndex === 0) {
-        // This is the first sub-pool of the second round
-    } else {
-        room.gameState.currentSubPoolOrderIndex++;
-    }
-    
-    room.gameState.currentPlayerInSubPoolIndex = -1;
-    room.gameState.nextSubPoolName = '';
-    room.gameState.nextSubPoolPlayers = [];
-    room.gameState.currentSubPoolPlayers = [];
-    
-    nextPlayerLogic(roomCode);
+    room.gameState.gameStatus = 'PRE_ROUND_TIMER';
+    broadcastGameState(roomCode);
+
+    setTimeout(() => {
+        const currentRoom = rooms[roomCode];
+        if (currentRoom) {
+            if (currentRoom.gameState.isSecondRound && currentRoom.gameState.currentSubPoolOrderIndex === 0) {
+                // First sub-pool of the second round, index is already correct
+            } else {
+                currentRoom.gameState.currentSubPoolOrderIndex++;
+            }
+            
+            currentRoom.gameState.currentPlayerInSubPoolIndex = -1;
+            currentRoom.gameState.nextSubPoolName = '';
+            currentRoom.gameState.nextSubPoolPlayers = [];
+            currentRoom.gameState.currentSubPoolPlayers = [];
+            
+            nextPlayerLogic(roomCode);
+        }
+    }, PRE_ROUND_DURATION_SECONDS * 1000);
 };
 
 const endRoundLogic = (roomCode) => {
