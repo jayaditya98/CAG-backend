@@ -203,6 +203,38 @@ const createInitialGameState = (roomCode, hostSessionId, hostPlayerName) => {
 };
 
 /**
+ * Resets a room's game state to the lobby, keeping players.
+ */
+const resetGameForLobby = (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    // Preserve players, but reset their game-specific stats
+    const preservedPlayers = room.gameState.players.map(p => ({
+        ...p,
+        budget: STARTING_BUDGET,
+        squad: [],
+        isReady: p.isHost, // Only host is ready by default
+        readyForAuction: p.isHost,
+    }));
+
+    const host = preservedPlayers.find(p => p.isHost);
+    if (!host) {
+        console.error(`Could not find host to reset room ${roomCode}`);
+        return;
+    }
+
+    // Create a fresh state, then overwrite players
+    const freshState = createInitialGameState(roomCode, host.id, host.name);
+    
+    room.gameState = {
+        ...freshState,
+        players: preservedPlayers,
+        lastActionMessage: 'Returned to lobby. The host can draw players for a new game.'
+    };
+};
+
+/**
  * Draws players based on specific role quotas and creates tiered sub-pools.
  */
 const drawPlayersLogic = (roomCode) => {
@@ -614,6 +646,13 @@ wss.on('connection', (ws) => {
             }
             break;
           }
+          case 'BACK_TO_LOBBY': {
+              if (player.isHost) {
+                  resetGameForLobby(userRoomCode);
+                  broadcastGameState(userRoomCode);
+              }
+              break;
+          }
         }
     } catch (error) { console.error('Failed to process message:', message, error); }
   });
@@ -641,7 +680,12 @@ wss.on('connection', (ws) => {
         } else {
              room.gameState.lastActionMessage = `${disconnectedPlayer.name} has left the game.`;
         }
-        broadcastGameState(userRoomCode);
+        // If in auction and the disconnected player was active, advance turn
+        if (room.gameState.gameStatus === 'AUCTION' && room.gameState.activePlayerId === userSessionId) {
+            advanceTurn(userRoomCode, userSessionId, 'DROP');
+        } else {
+            broadcastGameState(userRoomCode);
+        }
       }
     }
   });
