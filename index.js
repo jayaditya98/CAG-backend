@@ -10,9 +10,10 @@ import 'dotenv/config';
 const PORT = process.env.PORT || 8080;
 const STARTING_BUDGET = 10000;
 const TURN_DURATION_SECONDS = 7;
-const ROUND_OVER_DURATION_MS = 4000;
+const ROUND_OVER_DURATION_MS = 2500;
 const PRE_AUCTION_DURATION_SECONDS = 10;
 const PRE_ROUND_DURATION_SECONDS = 7;
+const PLAYER_BREAK_DURATION_SECONDS = 5;
 const MAX_PLAYERS_PER_ROOM = 4;
 
 // --- Supabase Setup ---
@@ -376,19 +377,28 @@ const nextPlayerLogic = (roomCode) => {
     room.gameState.currentBid = nextPlayer.basePrice;
     room.gameState.highestBidderId = null;
     room.gameState.playersInRound = room.gameState.players.filter(p => p.budget >= nextPlayer.basePrice).map(p => p.id);
-    room.gameState.gameStatus = 'AUCTION';
-
-    const masterOrder = room.gameState.masterBiddingOrder;
-    const startIndex = room.gameState.startingPlayerIndex;
-    room.gameState.biddingOrder = [...masterOrder.slice(startIndex), ...masterOrder.slice(0, startIndex)].filter(id => room.gameState.playersInRound.includes(id));
-    
-    room.gameState.activePlayerId = room.gameState.biddingOrder[0] || null;
-    room.gameState.startingPlayerIndex = (startIndex + 1) % masterOrder.length;
-
-    if (room.turnTimer) clearTimeout(room.turnTimer);
-    room.turnTimer = setTimeout(() => advanceTurn(roomCode, room.gameState.activePlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
-
+    room.gameState.gameStatus = 'PLAYER_BREAK_TIMER';
     broadcastGameState(roomCode);
+
+    setTimeout(() => {
+        const currentRoom = rooms[roomCode];
+        if (!currentRoom || currentRoom.gameState.gameStatus !== 'PLAYER_BREAK_TIMER' || currentRoom.gameState.currentPlayerForAuction?.id !== nextPlayer.id) {
+            return; // State has changed, abort auction start
+        }
+
+        currentRoom.gameState.gameStatus = 'AUCTION';
+        const masterOrder = currentRoom.gameState.masterBiddingOrder;
+        const startIndex = currentRoom.gameState.startingPlayerIndex;
+        currentRoom.gameState.biddingOrder = [...masterOrder.slice(startIndex), ...masterOrder.slice(0, startIndex)].filter(id => currentRoom.gameState.playersInRound.includes(id));
+        
+        currentRoom.gameState.activePlayerId = currentRoom.gameState.biddingOrder[0] || null;
+        currentRoom.gameState.startingPlayerIndex = (startIndex + 1) % masterOrder.length;
+
+        if (currentRoom.turnTimer) clearTimeout(currentRoom.turnTimer);
+        currentRoom.turnTimer = setTimeout(() => advanceTurn(roomCode, currentRoom.gameState.activePlayerId, 'TIMEOUT'), TURN_DURATION_SECONDS * 1000);
+
+        broadcastGameState(roomCode);
+    }, PLAYER_BREAK_DURATION_SECONDS * 1000);
 };
 
 const continueToNextSubPoolLogic = (roomCode) => {
