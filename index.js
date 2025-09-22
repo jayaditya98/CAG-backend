@@ -449,8 +449,10 @@ const continueToNextSubPoolLogic = (roomCode) => {
     setTimeout(() => {
         const currentRoom = rooms[roomCode];
         if (currentRoom) {
-            if (currentRoom.gameState.isSecondRound && currentRoom.gameState.currentSubPoolOrderIndex === 0) {
-                // First sub-pool of the second round, index is already correct
+            // This condition is true only for the very first transition into the unsold round,
+            // where the 'current' sub-pool is a special placeholder name.
+            if (currentRoom.gameState.isSecondRound && currentRoom.gameState.currentSubPoolName === "--- UNSOLD ROUND ---") {
+                // Index is already set to 0 when the unsold round was initiated. Do nothing.
             } else {
                 currentRoom.gameState.currentSubPoolOrderIndex++;
             }
