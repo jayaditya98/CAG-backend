@@ -483,6 +483,15 @@ const endRoundLogic = (roomCode) => {
             winnerId = winner.id;
             winningBid = currentBid;
             room.gameState.lastActionMessage = `${currentPlayerForAuction.name} sold to ${winner.name} for ${currentBid}!`;
+
+            // Check if all players' squads are full
+            const allTeamsFull = room.gameState.players.every(p => p.squad.length >= MAX_SQUAD_SIZE);
+            if (allTeamsFull) {
+                room.gameState.gameStatus = 'GAME_OVER';
+                room.gameState.lastActionMessage = 'All teams are full! The auction has ended.';
+                broadcastGameState(roomCode);
+                return; // End the game
+            }
         }
     } else {
         room.gameState.lastActionMessage = `${currentPlayerForAuction.name} was unsold.`;
